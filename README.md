@@ -23,7 +23,9 @@ working.)
 
 This targets the EARSeL 45th Symposium (Athens, 2026) abstract "*Toward
 Improved Soil Moisture Retrieval Using NISAR InSAR Closure Phase Signatures*"
-(Karamvasis & Karathanassi). Two pilot sites: **Alaska** (SNOTEL/USCRN
+(Karamvasis & Karathanassi) — see
+[`manuscript/EARSeL-template_abstract-submission_45th-Symp-Athens-2026.pdf`](manuscript/EARSeL-template_abstract-submission_45th-Symp-Athens-2026.pdf).
+Two pilot sites: **Alaska** (SNOTEL/USCRN
 network, working end-to-end with real NISAR + Sentinel-1 data — see
 [§1](#1-alaska-pilot-working-end-to-end)) and **Catalonia** (XMS-CAT network,
 planning-stage only, no driver notebook written yet — see
