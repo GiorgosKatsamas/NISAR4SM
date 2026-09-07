@@ -1,0 +1,11 @@
+# data generated/downloaded by the notebooks
+notebooks/ismn_data/
+notebooks/nisar_data/
+
+# jupyter / python
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# pixi
+.pixi/

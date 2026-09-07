@@ -1,0 +1,39 @@
+name: nisar4sm-pipeline
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10,<3.13
+  - numpy
+  - scipy
+  - pandas
+  - dask
+  - xarray
+  - rioxarray
+  - h5py
+  - rasterio
+  - pyproj
+  - shapely
+  - requests
+  - matplotlib
+  - asf_search
+  # cfgrib needs BOTH the python binding and the native eccodes C library --
+  # installing only 'cfgrib' leaves it unable to find eccodes at runtime.
+  - cfgrib
+  - eccodes
+  - dem_stitcher
+  - jupyter
+  - ipykernel
+
+# INSAR4SM-main/ is vendored in this repo (not a pip package) and is put on
+# sys.path directly by the notebook itself, so it doesn't need to be
+# installed here. This file only needs its *runtime* dependencies for the
+# specific functions the main notebooks call (calc_SM_coherences, invert_sm)
+# -- it intentionally omits the much heavier isce3/pyaps3/raider/pysolid
+# stack the full upstream package carries for workflows this project never
+# touches.
+#
+# nisar_pytools was also vendored here at one point, but only for a single
+# function (find_nisar, used by SME2_alaska.ipynb) -- that function (plus
+# its two validators) was inlined directly into the notebook instead of
+# keeping the ~5,000-line package around as a dependency; asf_search above
+# is its real runtime need.

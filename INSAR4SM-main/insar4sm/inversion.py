@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import numpy as np
+import datetime
+from itertools import combinations
+from scipy.optimize import minimize
+np.seterr(divide='ignore', invalid='ignore')
+
+from insar4sm.forward_modelling_funcs import Covar_modelled_calc
+from insar4sm.forward_modelling_funcs import phase_closure_modelled_calc
+from insar4sm.phase_closure_funcs import Covar_2_phase_closures
+
+def rewrap(data:np.array)-> np.array:
+    """Wraps the data between -pi and pi.
+
+    Args:
+        data (np.array): the data need to be wrapped
+
+    Returns:
+        np.array: Wrapped data. Values are between -pi and pi
+    """
+    return data - np.round(data/2.0/np.pi)*2.0*np.pi
+
+def inversion(SM0:np.array,
+              DS_mean_inc_angle:float,
+              opt_method:str,
+              opt_parms:dict,
+              Phase_closures:np.array,
+              kept_triplets:np.array,
+              SM_coh:np.array,
+              weight_factor: float,
+              dry_index:int,
+              dry_bands_inds:np.array,
+              sm_dry:float,
+              freq_GHz:float,
+              clay_pct:float,
+              sand_pct:float)->np.array:
+    """Soil moisture invertion functionality based on the De Zan`s model.
+
+    Args:
+        SM0 (np.array): Initial soil moisture values
+        DS_mean_inc_angle (float): Incidence angle in degrees.
+        opt_method (str): Minimization method
+        Phase_closures (np.array): Observed phase closures, already restricted
+            to `kept_triplets` (see invert_sm)
+        kept_triplets (np.array): (n_kept, 3) SAR index triplets that survive
+            the ph_closure_dist mask -- the only ones whose closure actually
+            enters the cost function
+        SM_coh (np.array): coherence due to soil moisture variations
+        weight_factor (float): the weighting factor of coherence loss
+        dry_index (int): index of driest SAR acquisition
+        dry_bands_inds (np.array): Indices of SAR acquisitions considered dry
+        sm_dry (float): Driest soil moisture value
+        freq_GHz (float): Operation frequency of SAR sensor in GHz.
+        clay_pct (float): Clay mass fraction (0-100)%.
+        sand_pct (float): Sand mass fraction (0-100)%.
+
+    Returns:
+        np.array: Soil moisture inverted values
+
+    ..References:
+        De Zan, F., Parizzi, A., Prats-Iraola, P., Lopez-Dekker, P., 2014. A SAR Interferometric Model for Soil Moisture. IEEE Trans. Geosci. Remote Sens. 52, 418-425. https://doi.org/10.1109/TGRS.2013.2241069
+    """
+
+    # calculate number of band that we are going to work with
+    n_bands_size = SM_coh.shape[0]
+
+    # observable 1: Coherence
+    coh_subset = SM_coh.copy()
+
+    # # Keep all elements
+    coh_dist_mask = np.ones_like(coh_subset).astype(np.bool_)
+
+    # creating nan mask
+    coh_nan_mask = ~np.isnan(coh_subset)
+
+    # combining masks
+    coh_final_mask = coh_dist_mask * coh_nan_mask
+    # applying mask
+    Coh_obs = coh_subset.copy()[coh_final_mask]
+
+    # observable 2: Phase closure -- Phase_closures is already restricted to
+    # kept_triplets by the caller, no further masking needed here
+    Phase_closures_obs = Phase_closures.copy()
+
+    def objective_function(SM0):
+        Covar_SM_model = Covar_modelled_calc( SM=SM0,
+                                              theta_inc = DS_mean_inc_angle,
+                                              freq_GHz = freq_GHz,
+                                              clay_pct = clay_pct,
+                                              sand_pct = sand_pct,
+                                              ifg_pairs = None)
+        # coherence component cost
+
+        Coh_SM_model = np.abs(Covar_SM_model)[coh_final_mask]
+
+        Coh_result = np.power(np.linalg.norm(Coh_SM_model-Coh_obs),2)
+
+        # phase closure component cost -- only compute closures for the
+        # triplets that are actually used (see invert_sm), instead of every
+        # (n choose 3) triplet followed by discarding most of them here
+
+        Phase_closures_DeZan = Covar_2_phase_closures(Covar_SM_model, triplets=kept_triplets)
+        Phase_closures_residuals = rewrap(Phase_closures_DeZan-Phase_closures_obs)
+        Phase_closure_result = np.sum(np.power(Phase_closures_residuals, 2))
+
+        # final cost
+        result = weight_factor*Coh_result + Phase_closure_result
+
+        return result
+    
+    # bounds of inverted soil moistures
+    #bounds_SM0 = (0,100)
+    bounds_SM0 = (0,50)
+    bounds = []
+    for element in range(n_bands_size):
+        bounds.append(bounds_SM0)
+        
+    # constraints
+    
+    cons_list = []
+    
+    # constraints related to dry SAR dates
+    sm_dry_thres = sm_dry + 1
+    for sar_dry_ind in dry_bands_inds:
+        cons_list.append({'type': 'ineq', 'fun': lambda SM, idx=sar_dry_ind:  sm_dry_thres-SM[idx]})
+
+    cons_list.append({'type': 'eq', 'fun': lambda SM:  SM[dry_index] - sm_dry})
+
+    cons = tuple(cons_list)
+    
+    # minimization
+    try:
+        
+        results = minimize(objective_function,
+                           SM0,
+                           options={'ftol':opt_parms['ftol'],'eps':opt_parms['eps'], 'maxiter':opt_parms['maxiter']},
+                           method=opt_method,
+                           bounds = bounds,
+                           constraints = cons)
+        
+    except RuntimeError:
+        
+        results = {}
+        results['x'] = np.full(SM0, np.nan, dtype = np.float64)
+        
+    return results['x']
+
+def invert_sm(ph_DS:np.array,
+              coh_sm:np.array,
+              SM_index:np.array,
+              dry_bands_inds:np.array,
+              slc_dates:np.array,
+              DS_ind:int,
+              driest_date:datetime.datetime,
+              inc_DS:float,
+              band_start:int,
+              band_end:int,
+              nbands:int,
+              opt_method:str,
+              opt_parms:dict,
+              ph_closure_dist:int = 15,
+              weight_factor:float = 1,
+              sm_dry_state:float = 3.0,
+              freq_GHz:float = 5.405,
+              clay_pct:float = 11,
+              sand_pct:float = 79)->np.array:
+    """Soil moisture invertion based on the De Zan`s model.
+
+    Args:
+        ph_DS (np.array): Interferometric (complex) values for the selected distributed scatterer (DS)
+        coh_sm (np.array): Coherence due to soil moisture variations
+        SM_index (np.array): Soil moisture proxy index information
+        dry_bands_inds (np.array): Indices of SAR acquisitions considered dry
+        slc_dates (np.array): Datetimes of SLC acquisitions
+        DS_ind (int): Index of DS
+        driest_date (datetime.datetime): Datetime of driest SLC acquisition
+        inc_DS (float): Incidence angle in degrees.
+        band_start (int): Index of the first SAR acqusition
+        band_end (int): Index of the last SAR acqusition
+        nbands (int): number of SAR acquisitions used
+        opt_method (str): Minimization method
+        ph_closure_dist (int, optional): the temporal difference (distance between SARs) that will be considered. 4 means only 3 sequential SARs will be used. Defaults to 15.
+        sm_dry_state (float, optional): Driest soil moisture value. Defaults to 3.0.
+        freq_GHz (float, optional): Operation frequency of SAR sensor in GHz. Defaults to 5.405.
+        clay_pct (float, optional): Clay mass fraction (0-100)%. Defaults to 11.
+        sand_pct (float, optional): Sand mass fraction (0-100)%. Defaults to 79.
+
+    Returns:
+        np.array: Soil moisture inverted values
+        
+    ..References:
+        De Zan, F., Parizzi, A., Prats-Iraola, P., Lopez-Dekker, P., 2014. A SAR Interferometric Model for Soil Moisture. IEEE Trans. Geosci. Remote Sens. 52, 418-425. https://doi.org/10.1109/TGRS.2013.2241069   
+    """
+    #%% 1. Load data
+    
+    DS_mean_inc_angle = inc_DS[0]
+
+    SM_covar = ph_DS[DS_ind, band_start:band_end, band_start:band_end]
+    SM_coh = coh_sm[band_start:band_end,band_start:band_end]
+
+    dry_index = int(dry_bands_inds[0]) if dry_bands_inds.size > 0 else 0
+    n_bands_size = SM_coh.shape[0]
+    if dry_index < 0 or dry_index >= n_bands_size:
+        dry_index = 0
+    dry_bands_inds = np.clip(dry_bands_inds, 0, n_bands_size - 1)
+
+    #%% 2. Inversion
+
+    ## 1. Create the phase closure mask to select the short-time phase closures!
+    # construct the triangle_idx_array and ifg_pairs matrices
+    # phase_closure_modelled_calc_start_time = time.time()
+    [Phase_closures_model,
+      ifg_soil_moistures,
+      G,
+      triangle_idx_array,
+      ifg_pairs]  = phase_closure_modelled_calc(np.random.rand(nbands),
+                                                freq_GHz,
+                                                clay_pct,
+                                                sand_pct,
+                                                DS_mean_inc_angle)
+
+
+    # create mask with short time spans of phase closures
+
+    Mask_ph_closure = np.zeros(triangle_idx_array.shape[0], bool)
+    for ph_closure_ind, ph_closure_ints in enumerate(triangle_idx_array):
+        int0 = ifg_pairs[ph_closure_ints[0]]
+        int1 = ifg_pairs[ph_closure_ints[1]]
+        int2 = ifg_pairs[ph_closure_ints[2]]
+
+        min_int = np.min(np.array([int0, int1, int2]))
+        max_int = np.max(np.array([int0, int1, int2]))
+        if max_int-min_int < ph_closure_dist:
+            Mask_ph_closure[ph_closure_ind] = True
+
+    # Only the triplets that survive the mask above are ever used downstream
+    # (see inversion()) -- compute observed closures for just those instead
+    # of every (n choose 3) triplet and discarding most of them, which
+    # matters more as nbands grows (the full triplet count is cubic in
+    # nbands, the kept subset grows much slower).
+    all_triplets = np.array(list(combinations(range(n_bands_size), 3)))
+    kept_triplets = all_triplets[Mask_ph_closure]
+    Phase_closures = Covar_2_phase_closures(SM_covar, triplets=kept_triplets)
+
+    ## 2. Inversion
+    SM_results = inversion(SM0 = SM_index,
+                           DS_mean_inc_angle = DS_mean_inc_angle,
+                           opt_method = opt_method,
+                           opt_parms = opt_parms,
+                           Phase_closures = Phase_closures,
+                           kept_triplets = kept_triplets,
+                           SM_coh = SM_coh,
+                           weight_factor = weight_factor,
+                           dry_index = dry_index,
+                           dry_bands_inds = dry_bands_inds,
+                           sm_dry = sm_dry_state,
+                           freq_GHz = freq_GHz,
+                           clay_pct = clay_pct,
+                           sand_pct = sand_pct)
+
+    return SM_results
