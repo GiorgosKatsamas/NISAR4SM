@@ -9,6 +9,7 @@
 /soilgrids_data/
 /S1_burst_data_alaska/
 /S1_coherence_closure_alaska/
+/S1_SM_estimates_alaska.csv
 /Data_separate_files_header_*/
 /Data_separate_files_header_*.zip
 /Earsel26_NISAR-main/notebooks/ismn_data/

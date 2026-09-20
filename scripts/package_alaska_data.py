@@ -1,6 +1,7 @@
 """Assemble refined_data_alaska/: a single folder with everything the 4 main
 Alaska notebooks (NISAR_SM_alaska.ipynb, S1_SM_alaska.ipynb, Checks_alaska.ipynb,
-Checks_alaska_S1.ipynb) need, for handing off to colleagues.
+Checks_alaska_S1.ipynb) and Station_overview_alaska.ipynb need, for handing
+off to colleagues.
 
 Copies (never moves) from the working locations those notebooks actually read
 from -- rerunning this script is always safe and picks up any data changes.
@@ -25,6 +26,13 @@ SOURCES = [
     ("soilgrids", REPO_ROOT / "soilgrids_data" / "alaska", None),
     # SME2: only the small cache + manifest, never the ~26 GB of raw .h5 granules.
     ("sme2", REPO_ROOT / "SME2_data_alaska", {"station_manifest.json", "sme2_cache.csv"}),
+]
+
+# (destination path, source file) -- individual files rather than whole directories.
+FILES = [
+    ("nisar_sm_estimates.csv",
+     REPO_ROOT / "Earsel26_NISAR-main" / "notebooks" / "nisar_data" / "alaska_NISAR_SM_estimates.csv"),
+    ("s1_sm_estimates.csv", REPO_ROOT / "S1_SM_estimates_alaska.csv"),
 ]
 
 
@@ -59,6 +67,17 @@ def main():
         total_files += n_files
         total_bytes += n_bytes
         print(f"  {name}: {n_files} file(s), {n_bytes / 1e6:.1f} MB  <- {src}")
+
+    for name, src in FILES:
+        if not src.exists():
+            print(f"  [skip] {src} does not exist")
+            continue
+        dst = OUT_DIR / name
+        shutil.copy2(src, dst)
+        n_bytes = src.stat().st_size
+        total_files += 1
+        total_bytes += n_bytes
+        print(f"  {name}: {n_bytes / 1e6:.1f} MB  <- {src}")
 
     print(f"\n{OUT_DIR}: {total_files} file(s) total, {total_bytes / 1e6:.1f} MB")
     print("Zip this folder to hand off to colleagues.")

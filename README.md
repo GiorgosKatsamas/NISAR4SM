@@ -58,6 +58,16 @@ feeds them:
 | [`Checks_alaska.ipynb`](Checks_alaska.ipynb) | De Zan model sanity check: does NISAR coherence loss / closure phase actually track real ISMN SM differences? Reads the same precomputed coherence/closure CSVs as `NISAR_SM_alaska.ipynb`, no inversion |
 | [`Checks_alaska_S1.ipynb`](Checks_alaska_S1.ipynb) | Same sanity check for Sentinel-1 |
 
+Supplementary: [`Station_overview_alaska.ipynb`](Station_overview_alaska.ipynb) — a
+per-station dashboard pulling together everything above (NDVI/in-situ SM,
+per-track coherence/closure-phase-vs-SM-diff regressions, NISAR+SME2/S1
+estimate timeseries, local incidence angle, terrain slope), one page per
+station, with axis ranges and track/orbit colors held fixed across every
+station and panel so they're directly comparable. Needs
+`NISAR_SM_alaska.ipynb`/`S1_SM_alaska.ipynb` to have been run at least once
+first (it reads their exported SM-estimate CSVs, not recomputing the
+inversion itself).
+
 ### 1.2 Auxiliary notebooks (data preparation — run once, in order)
 
 You only need these if you're regenerating the data from scratch. **If you
@@ -104,6 +114,8 @@ below, so this is safe to rerun any time the underlying data changes.
 | `S1_coherence_closure_alaska/` | Per-(station, orbit) Sentinel-1 coherence + closure-phase CSVs | `S1_SM_alaska.ipynb`, `Checks_alaska_S1.ipynb` | ~0.1 MB |
 | `soilgrids_data/alaska/` | SoilGrids sand/clay rasters, cropped to a 0.25°-buffered bbox around the 20 Alaska stations (was 343.5 MB full-resolution; sampled values verified pixel-identical for every station) | `NISAR_SM_alaska.ipynb`, `S1_SM_alaska.ipynb` | 107.7 MB |
 | `SME2_data_alaska/station_manifest.json` + `sme2_cache.csv` | Per-station nearest-pixel SME2 SM% already extracted from the raw granules (both notebooks now read this cache first if present, falling back to the raw HDF5s otherwise) — **do not send the raw `.h5` files**, only these two small files | `NISAR_SM_alaska.ipynb` §8b, `S1_SM_alaska.ipynb` §8b (optional comparison only) | ~10 KB |
+| `Earsel26_NISAR-main/notebooks/nisar_data/alaska_NISAR_SM_estimates.csv` | Exported `sm_map` from `NISAR_SM_alaska.ipynb`'s §12 (station, track, depth, date, sm_pct, is_dry_anchor) | `Station_overview_alaska.ipynb` | ~0.05 MB |
+| `S1_SM_estimates_alaska.csv` | Same, exported from `S1_SM_alaska.ipynb`'s §12 | `Station_overview_alaska.ipynb` | ~0.02 MB |
 
 Everything the 4 main notebooks need, including the two rows above, is now
 about 111 MB total — down from ~26.6 GB. Both changes were verified to
