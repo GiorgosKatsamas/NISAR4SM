@@ -1,11 +1,10 @@
-"""Assemble refined_data_alaska/: a single folder with everything the 4 main
-Alaska notebooks (NISAR_SM_alaska.ipynb, S1_SM_alaska.ipynb, Checks_alaska.ipynb,
-Checks_alaska_S1.ipynb) and Station_overview_alaska.ipynb need, for handing
-off to colleagues.
+"""Assemble refined_data_alaska/: a single folder with everything
+03a_estimate_sm_nisar.ipynb, 03b_estimate_sm_s1.ipynb, and
+04_station_overview.ipynb need.
 
-Copies (never moves) from the working locations those notebooks actually read
+Copies from the working locations those notebooks actually read
 from -- rerunning this script is always safe and picks up any data changes.
-See README.md section 1.3 for what's in each subfolder and why.
+See README.md for what's in each subfolder and why.
 
 Usage: python scripts/package_alaska_data.py
 """
@@ -17,11 +16,11 @@ OUT_DIR = REPO_ROOT / "refined_data_alaska"
 
 # (destination subfolder, source directory, optional filename filter)
 SOURCES = [
-    ("ismn", REPO_ROOT / "Earsel26_NISAR-main" / "notebooks" / "ismn_data" / "alaska", None),
+    ("ismn", REPO_ROOT / "ismn_data" / "alaska", None),
     ("nisar_coherence_closure",
-     REPO_ROOT / "Earsel26_NISAR-main" / "notebooks" / "nisar_data" / "alaska_GSLC_coherence_closure", None),
+     REPO_ROOT / "nisar_data" / "alaska_GSLC_coherence_closure", None),
     ("nisar_ndvi",
-     REPO_ROOT / "Earsel26_NISAR-main" / "notebooks" / "nisar_data" / "alaska_HLS_ndvi", None),
+     REPO_ROOT / "nisar_data" / "alaska_HLS_ndvi", None),
     ("s1_coherence_closure", REPO_ROOT / "S1_coherence_closure_alaska", None),
     ("soilgrids", REPO_ROOT / "soilgrids_data" / "alaska", None),
     # SME2: only the small cache + manifest, never the ~26 GB of raw .h5 granules.
@@ -31,7 +30,7 @@ SOURCES = [
 # (destination path, source file) -- individual files rather than whole directories.
 FILES = [
     ("nisar_sm_estimates.csv",
-     REPO_ROOT / "Earsel26_NISAR-main" / "notebooks" / "nisar_data" / "alaska_NISAR_SM_estimates.csv"),
+     REPO_ROOT / "nisar_data" / "alaska_NISAR_SM_estimates.csv"),
     ("s1_sm_estimates.csv", REPO_ROOT / "S1_SM_estimates_alaska.csv"),
 ]
 

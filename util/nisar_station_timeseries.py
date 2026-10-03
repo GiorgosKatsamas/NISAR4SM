@@ -1,9 +1,11 @@
 """
 Shared pipeline for building per-station NISAR GCOV backscatter time series
-against ISMN soil moisture stations, used by the moistx/02_get_NISAR_*_data.ipynb
-notebooks. Each notebook stays responsible for its own AOI-specific bits (loading
-its own stations.geojson, picking its own output directory, and the
-earthaccess/fsspec session setup) and calls compute_station_terrain() followed by
+against ISMN soil moisture stations, and for the terrain (slope/aspect/local
+incidence angle) helpers used by 01b_get_nisar_gslc_windows.ipynb,
+01c_get_hls_ndvi.ipynb, and 04_station_overview.ipynb. Each caller stays
+responsible for its own AOI-specific bits (loading its own stations.geojson,
+picking its own output directory, and the earthaccess/fsspec session setup)
+and calls compute_station_terrain() followed by
 process_station() per station.
 """
 
@@ -67,32 +69,31 @@ def get_fsspec_https_session_with_timeout(
     sock_connect_seconds: int = FETCH_CONNECT_TIMEOUT_SECONDS,
 ) -> fsspec.AbstractFileSystem:
     """
-    Same bearer-token HTTPS session as earthaccess.get_fsspec_https_session(), but
-    with an explicit aiohttp timeout. That function (earthaccess/store.py's
-    get_fsspec_session) builds its aiohttp.ClientSession with only headers/trust_env
-    in client_kwargs -- no timeout -- so a stalled fetch (a connection accepted but
-    that stops sending data mid-stream; the DAAC's presigned S3/CloudFront URLs have
-    been observed doing this under load) falls back to aiohttp's own default
-    (ClientTimeout(total=300, sock_connect=30)) at best, and in practice can hang far
-    longer once fsspec's own background block-prefetch/retry queuing is factored in --
-    observed hanging 17+ minutes on a single HVHV window read before being manually
-    interrupted. A short explicit timeout here makes a stalled fetch fail predictably
-    instead of hanging indefinitely; paired with retrying on aiohttp.ClientError (not
-    just ClientResponseError) below, so a timeout gets the same retry-with-backoff
-    treatment as an HTTP error status instead of crashing outright.
+    Same bearer-token HTTPS session as earthaccess.get_fsspec_https_session(),
+    with an explicit aiohttp timeout so a stalled fetch fails predictably
+    instead of hanging indefinitely.
 
-    skip_instance_cache=True: HTTPFileSystem is `cachable` (fsspec's `_Cached`
-    metaclass), so calling this function twice with the same arguments would
-    otherwise hand back the *same* underlying instance -- including its one lazily-
-    created aiohttp.ClientSession -- shared across every caller. Combined with
-    run_with_timeout's documented behavior of leaving a timed-out extraction's
-    thread running in the background rather than cancelling it, that shared instance
-    is what let two genuinely concurrent granule reads run on the same session:
-    diagnosed after saved GSLC window files turned up with a `native_id` attr naming
-    a different granule than that same file's own `acquisition_datetime_utc` /
-    `track_number` / `orbit_pass_direction` attrs (see process_station /
-    process_station_gslc below, which now open a fresh instance per granule instead
-    of sharing one across a station's whole granule loop).
+    Args:
+        total_seconds (int): Total request timeout.
+        sock_connect_seconds (int): Connect timeout.
+
+    Returns:
+        fsspec.AbstractFileSystem: A fresh (skip_instance_cache=True) HTTPS filesystem.
+
+    Notes:
+        earthaccess's own get_fsspec_https_session() builds its session with
+        no timeout at all; a stalled fetch (the DAAC's presigned S3/CloudFront
+        URLs have been observed doing this under load) was seen hanging 17+
+        minutes on a single window read. Paired with retrying on
+        aiohttp.ClientError below, so a timeout gets the same retry-with-backoff
+        treatment as an HTTP error status.
+        `skip_instance_cache=True` is required, not cosmetic: fsspec's
+        HTTPFileSystem is cachable, so reusing a cached instance let two
+        concurrent granule reads share one aiohttp session -- diagnosed after
+        saved GSLC files turned up with a `native_id` attr naming a different
+        granule than that same file's own acquisition metadata (see
+        process_station / process_station_gslc, which open a fresh instance
+        per granule).
     """
     token = earthaccess.__auth__.token["access_token"]
     client_kwargs = {
@@ -115,30 +116,29 @@ PER_GRANULE_TIMEOUT_SECONDS = 180
 
 def run_with_timeout(func: Callable, args: tuple, timeout_seconds: float) -> tuple[bool, Any]:
     """
-    Run func(*args) in a fresh daemon thread, waiting up to timeout_seconds for a
-    result. There's no SIGALRM on Windows, so a background thread is the standard
-    way to bound a call (like extract_granule_record / extract_and_save_gslc_window)
-    that has no way to be cancelled from outside once started.
+    Run func(*args) in a fresh daemon thread, waiting up to timeout_seconds
+    for a result.
 
-    A *fresh* thread per call, not a shared bounded pool (the first version of this
-    used ThreadPoolExecutor(max_workers=4) + future.result(timeout=...)): a timed-out
-    call's thread keeps running in the background, since Python can't forcibly kill a
-    thread. With a bounded pool, enough timeouts permanently exhaust all workers --
-    observed in practice: exactly 4 granules timed out (matching max_workers=4), and
-    every single granule submitted after that also "timed out" after 180s without
-    ever actually starting, since none could get a free worker. A fresh thread per
-    call has no shared resource to exhaust. daemon=True means even if many calls
-    time out over a long run, the leaked threads don't block the interpreter/kernel
-    from exiting normally (a non-daemon thread would keep it alive indefinitely,
-    since concurrent.futures.ThreadPoolExecutor's own threads are non-daemon and
-    joined at exit).
+    Args:
+        func (Callable): The call to run.
+        args (tuple): Positional args for func.
+        timeout_seconds (float): How long to wait before giving up on it.
 
-    func, args: the call to run
-    timeout_seconds: how long to wait before giving up on it
-    returns: (True, func(*args)) on success within the deadline, or (False, None) on
-        timeout. An exception raised by func itself propagates from this call (not
-        swallowed), same as calling func(*args) directly, as long as it's raised
-        within the deadline.
+    Returns:
+        tuple[bool, Any]: (True, func(*args)) on success within the
+            deadline, or (False, None) on timeout. An exception raised by
+            func propagates from this call if raised within the deadline.
+
+    Notes:
+        There's no SIGALRM on Windows, so a background thread is the standard
+        way to bound a call that has no way to be cancelled once started. A
+        *fresh* thread per call, not a shared bounded pool: a timed-out
+        call's thread keeps running (Python can't forcibly kill a thread), so
+        a shared pool can be permanently exhausted once enough calls time out
+        (observed: 4 timeouts with max_workers=4 left every later call
+        "timing out" immediately, with no free worker to even start). A fresh
+        thread per call has no shared resource to exhaust; daemon=True keeps
+        leaked threads from blocking interpreter exit.
     """
     result_queue: queue.Queue = queue.Queue(maxsize=1)
 
@@ -177,10 +177,17 @@ CRID_PARTS_RE = re.compile(r"^([A-Za-z]*)(\d*)$")
 
 def _crid_sort_key(crid: str) -> tuple[str, int]:
     """
-    Numeric-aware sort key for a CRID like "D00340" (letter prefix + digits): a
-    plain string comparison breaks once the digit run's width differs (e.g.
-    "D100" would sort *before* "D99", since '1' < '9' lexicographically) even
-    though 100 > 99 numerically.
+    Numeric-aware sort key for a CRID like "D00340" (letter prefix + digits).
+
+    Args:
+        crid (str): CRID string.
+
+    Returns:
+        tuple[str, int]: (letters, digits) sort key.
+
+    Notes:
+        A plain string comparison breaks once the digit run's width differs
+        (e.g. "D100" sorts before "D99" lexicographically, despite 100 > 99).
     """
     m = CRID_PARTS_RE.match(crid)
     letters, digits = m.groups() if m else (crid, "")
@@ -189,15 +196,19 @@ def _crid_sort_key(crid: str) -> tuple[str, int]:
 
 def keep_latest_versions(results: list, crid_re: re.Pattern = CRID_RE) -> list:
     """
-    Keep only the highest-CRID (Composite Release Identifier) granule per unique
-    acquisition, parsed from each result's native-id, so reprocessed granules that
-    CMR returns under multiple CRIDs don't create duplicate rows.
+    Keep only the highest-CRID (Composite Release Identifier) granule per
+    unique acquisition, so reprocessed granules CMR returns under multiple
+    CRIDs don't create duplicate rows.
 
-    results: earthaccess search_data() results
-    crid_re: native-id regex capturing (product, crid); defaults to GCOV's, pass
-        a product-specific pattern (e.g. GSLC) for other product lines that share
-        the same native-id token structure
-    returns: results with older-CRID duplicates removed
+    Args:
+        results (list): earthaccess search_data() results.
+        crid_re (re.Pattern): native-id regex capturing (product, crid);
+            defaults to GCOV's -- pass a product-specific pattern (e.g.
+            GSLC) for other product lines sharing the same native-id token
+            structure.
+
+    Returns:
+        list: results with older-CRID duplicates removed.
     """
     best = {}
     for result in results:
@@ -217,16 +228,24 @@ def filter_tracks_with_min_acquisitions(
 ) -> list:
     """
     Keep only results whose relative orbit/track covers the station at least
-    min_acquisitions times in the search window, parsed from native-id's track
-    number and start time (no download needed). Acquisitions from the same
-    overpass split across adjacent frames (within gap_seconds) count as one.
+    `min_acquisitions` times in the search window.
 
-    results: earthaccess search_data() results (post version-dedup)
-    min_acquisitions: minimum acquisitions a track must have to be kept
-    gap_seconds: max gap between acquisitions still counted as the same overpass
-    granule_id_re: native-id regex capturing (track, start); defaults to GCOV's,
-        pass a product-specific pattern for other product lines
-    returns: results belonging to tracks with enough acquisitions
+    Args:
+        results (list): earthaccess search_data() results (post version-dedup).
+        min_acquisitions (int): Minimum acquisitions a track must have to be kept.
+        gap_seconds (int): Max gap between acquisitions still counted as the
+            same overpass.
+        granule_id_re (re.Pattern): native-id regex capturing (track, start);
+            defaults to GCOV's, pass a product-specific pattern for other
+            product lines.
+
+    Returns:
+        list: results belonging to tracks with enough acquisitions.
+
+    Notes:
+        Parsed from native-id's track number and start time -- no download
+        needed. Acquisitions from the same overpass split across adjacent
+        frames (within gap_seconds) count as one.
     """
     rows = []
     for i, result in enumerate(results):
@@ -256,16 +275,23 @@ def merge_adjacent_acquisitions(
     station_df: pd.DataFrame, gap_seconds: int = ADJACENT_PASS_GAP_SECONDS
 ) -> pd.DataFrame:
     """
-    Collapse same-pass adjacent-frame rows (gap to the previous acquisition <=
-    gap_seconds) into one row per physical overpass. NISAR_L_*_db_mean3x3 is
-    averaged in linear power (dB values can't be arithmetically averaged
-    directly); NISAR_L_*_db_std3x3 is averaged directly (a simple approximation —
-    same-pass boundary cases are rare enough that a statistically rigorous pooled
-    combination isn't worth the extra complexity here).
+    Collapse same-pass adjacent-frame rows (gap to the previous acquisition
+    <= gap_seconds) into one row per physical overpass.
 
-    station_df: rows for one station, with columns matching OUTPUT_COLUMNS
-    gap_seconds: max gap between rows still counted as the same overpass
-    returns: one row per physical overpass
+    Args:
+        station_df (pd.DataFrame): Rows for one station, columns matching
+            OUTPUT_COLUMNS.
+        gap_seconds (int): Max gap between rows still counted as the same overpass.
+
+    Returns:
+        pd.DataFrame: One row per physical overpass.
+
+    Notes:
+        NISAR_L_*_db_mean3x3 is averaged in linear power (dB values can't be
+        averaged directly); NISAR_L_*_db_std3x3 is averaged directly (a
+        simple approximation -- same-pass boundary cases are rare enough
+        that a statistically rigorous pooled combination isn't worth the
+        extra complexity here).
     """
     df = station_df.copy()
     df["_dt"] = pd.to_datetime(df["datetime_utc"])
@@ -300,16 +326,25 @@ def already_in_csv(
     result, existing_df: pd.DataFrame | None, gap_seconds: int = ADJACENT_PASS_GAP_SECONDS
 ) -> bool:
     """
-    Identify a granule from its native-id alone (track + start time) to check
-    whether it's already saved in a station's CSV, without opening/streaming
-    anything. A CSV row matches if it's the same track and within gap_seconds of
-    the granule's start time (same tolerance used by merge_adjacent_acquisitions,
-    since a merged row's datetime_utc is the mean of its constituent times).
+    Identify a granule from its native-id alone (track + start time), to
+    check whether it's already saved in a station's CSV without
+    opening/streaming anything.
 
-    result: a single earthaccess search_data() result
-    existing_df: the station's existing CSV, with a parsed "_dt" datetime column, or None
-    gap_seconds: same-overpass tolerance, see merge_adjacent_acquisitions
-    returns: True if this granule is already represented in existing_df
+    Args:
+        result: A single earthaccess search_data() result.
+        existing_df (pd.DataFrame | None): The station's existing CSV, with
+            a parsed "_dt" datetime column, or None.
+        gap_seconds (int): Same-overpass tolerance, see
+            merge_adjacent_acquisitions.
+
+    Returns:
+        bool: True if this granule is already represented in existing_df.
+
+    Notes:
+        A CSV row matches if it's the same track and within gap_seconds of
+        the granule's start time (same tolerance merge_adjacent_acquisitions
+        uses, since a merged row's datetime_utc is the mean of its
+        constituent times).
     """
     if existing_df is None or existing_df.empty:
         return False
@@ -345,13 +380,19 @@ def _open_dem_tile(lat: float, lon: float, tile_cache: dict[str, Any]) -> Any:
 
 def slope_aspect_from_dem(lon: float, lat: float, tile_cache: dict[str, Any]) -> tuple[float, float, float]:
     """
-    Local terrain slope/aspect (Horn's method) and elevation from a 3x3 Copernicus
-    GLO-30 window centered on (lon, lat).
+    Local terrain slope/aspect (Horn's method) and elevation from a 3x3
+    Copernicus GLO-30 window centered on (lon, lat).
 
-    lon, lat: station coordinates
-    tile_cache: dict of open DEM tile datasets, reused across calls sharing a tile
-    returns: (slope_deg, aspect_deg, elevation_m); aspect is the downhill compass
-        bearing, clockwise from north; elevation_m is the window's center pixel
+    Args:
+        lon (float): Station longitude.
+        lat (float): Station latitude.
+        tile_cache (dict): Open DEM tile datasets, reused across calls
+            sharing a tile.
+
+    Returns:
+        tuple[float, float, float]: (slope_deg, aspect_deg, elevation_m);
+            aspect is the downhill compass bearing, clockwise from north;
+            elevation_m is the window's center pixel.
     """
     src = _open_dem_tile(lat, lon, tile_cache)
     row, col = src.index(lon, lat)
@@ -383,12 +424,18 @@ def slope_aspect_from_dem(lon: float, lat: float, tile_cache: dict[str, Any]) ->
 
 def surface_normal_enu(slope_deg: float, aspect_deg: float) -> np.ndarray:
     """
-    Unit surface normal in local East-North-Up coordinates. Horizontal component
-    points in the *downhill* (aspect) direction (e.g. a south-facing cliff's
-    normal points due south).
+    Unit surface normal in local East-North-Up coordinates.
 
-    slope_deg, aspect_deg: from slope_aspect_from_dem
-    returns: 3-element unit vector [East, North, Up]
+    Args:
+        slope_deg (float): From slope_aspect_from_dem.
+        aspect_deg (float): From slope_aspect_from_dem.
+
+    Returns:
+        np.ndarray: 3-element unit vector [East, North, Up].
+
+    Notes:
+        The horizontal component points in the *downhill* (aspect)
+        direction (e.g. a south-facing cliff's normal points due south).
     """
     b = np.radians(slope_deg)
     a = np.radians(aspect_deg)
@@ -397,13 +444,18 @@ def surface_normal_enu(slope_deg: float, aspect_deg: float) -> np.ndarray:
 
 def compute_station_terrain(stations: list[dict]) -> None:
     """
-    Compute and attach DEM-derived terrain to each station in place:
-    dem_slope_deg, dem_aspect_deg, dem_elevation_m, surface_normal_enu. On a DEM
-    lookup failure for a given station these are set to NaN (surface_normal_enu to
-    an all-NaN vector), which propagates cleanly through downstream local
-    incidence angle computation rather than raising.
+    Compute and attach DEM-derived terrain to each station in place.
 
-    stations: list of station dicts, each with "name", "lon", "lat"; mutated in place
+    Args:
+        stations (list[dict]): Station dicts, each with "name", "lon",
+            "lat"; mutated in place with dem_slope_deg, dem_aspect_deg,
+            dem_elevation_m, surface_normal_enu.
+
+    Notes:
+        On a DEM lookup failure for a station these are set to NaN
+        (surface_normal_enu to an all-NaN vector), which propagates cleanly
+        through downstream local-incidence-angle computation rather than
+        raising.
     """
     tile_cache: dict[str, Any] = {}
     print("Computing local terrain slope/aspect from Copernicus GLO-30 for each station...")
@@ -440,15 +492,22 @@ def calibrate_to_reference_angle(
     sigma0_db: float, theta_local_deg: float, theta_ref_deg: float = REFERENCE_INCIDENCE_ANGLE_DEG
 ) -> float:
     """
-    Cosine power law (n=1, the standard surface/Bragg-scattering normalization)
-    against the *local* incidence angle, referenced to theta_ref_deg. Only used to
-    build the *_calibrated columns; the raw NISAR_L_HH_db/NISAR_L_HV_db columns are
-    left as measured so this can be recomputed with a different model or reverted.
+    Cosine power law (n=1, standard surface/Bragg-scattering normalization)
+    against the *local* incidence angle, referenced to theta_ref_deg.
 
-    sigma0_db: raw backscatter in dB
-    theta_local_deg: local (terrain-corrected) incidence angle in degrees
-    theta_ref_deg: reference angle to normalize to
-    returns: calibrated backscatter in dB, or NaN if either input is NaN
+    Args:
+        sigma0_db (float): Raw backscatter in dB.
+        theta_local_deg (float): Local (terrain-corrected) incidence angle
+            in degrees.
+        theta_ref_deg (float): Reference angle to normalize to.
+
+    Returns:
+        float: Calibrated backscatter in dB, or NaN if either input is NaN.
+
+    Notes:
+        Only used to build the *_calibrated columns; the raw
+        NISAR_L_HH_db/NISAR_L_HV_db columns are left as measured, so this
+        can be recomputed with a different model or reverted.
     """
     if not (np.isfinite(sigma0_db) and np.isfinite(theta_local_deg)):
         return np.nan
@@ -463,10 +522,24 @@ def _interp_radar_grid_field(
     rg, field_name: str, rg_h: np.ndarray, yi_rg: int, xi_rg: int, elevation_m: float
 ) -> float:
     """
-    Nearest (y, x) cell, linear interpolation over height only, for a radarGrid
-    (height, y, x) field. Reads only the (at most two) height levels needed
-    instead of the full ~43 MB/field cube. Returns NaN without touching rg_h if
-    elevation_m is NaN (e.g. from a failed DEM lookup for this station).
+    Nearest (y, x) cell, linear interpolation over height only, for a
+    radarGrid (height, y, x) field.
+
+    Args:
+        rg: Open radarGrid h5py group.
+        field_name (str): Field to read (e.g. "incidenceAngle").
+        rg_h (np.ndarray): radarGrid height levels.
+        yi_rg (int): Nearest-cell row index.
+        xi_rg (int): Nearest-cell column index.
+        elevation_m (float): Station elevation.
+
+    Returns:
+        float: Interpolated value, or NaN if elevation_m is NaN (e.g. a
+            failed DEM lookup for this station).
+
+    Notes:
+        Reads only the (at most two) height levels needed, instead of the
+        full ~43 MB/field cube.
     """
     if not np.isfinite(elevation_m):
         return np.nan
@@ -484,13 +557,19 @@ def _interp_radar_grid_field(
 
 def _window_mean_db(power_window: np.ndarray, valid_mask: np.ndarray) -> float:
     """
-    Mean backscatter in dB over a window of linear power values, averaging in
-    linear power first (dB values can't be arithmetically averaged directly),
-    over only the pixels flagged valid.
+    Mean backscatter in dB over a window of linear power values.
 
-    power_window: 2D array of raw (linear) backscatter power
-    valid_mask: same-shape boolean array, True where the pixel should be included
-    returns: mean backscatter in dB, or NaN if no pixel in the window is valid
+    Args:
+        power_window (np.ndarray): Raw (linear) backscatter power.
+        valid_mask (np.ndarray): Same-shape boolean array, True where the
+            pixel should be included.
+
+    Returns:
+        float: Mean backscatter in dB, or NaN if no pixel in the window is valid.
+
+    Notes:
+        Averages in linear power first -- dB values can't be arithmetically
+        averaged directly.
     """
     valid_power = power_window[valid_mask]
     return float(10 * np.log10(valid_power.mean())) if valid_power.size else np.nan
@@ -498,14 +577,21 @@ def _window_mean_db(power_window: np.ndarray, valid_mask: np.ndarray) -> float:
 
 def _window_std_db(power_window: np.ndarray, valid_mask: np.ndarray) -> float:
     """
-    Sample standard deviation (ddof=1) of the per-pixel dB-converted values over
-    a window, computed directly in the dB domain (unlike the mean, there's no
-    clean power-domain equivalent of a spread statistic). NaN if fewer than 2
-    valid pixels remain in the window.
+    Sample standard deviation (ddof=1) of the per-pixel dB-converted values
+    over a window.
 
-    power_window: 2D array of raw (linear) backscatter power
-    valid_mask: same-shape boolean array, True where the pixel should be included
-    returns: sample std of dB values over the valid pixels, or NaN
+    Args:
+        power_window (np.ndarray): Raw (linear) backscatter power.
+        valid_mask (np.ndarray): Same-shape boolean array, True where the
+            pixel should be included.
+
+    Returns:
+        float: Sample std of dB values over the valid pixels, or NaN if
+            fewer than 2 valid pixels remain.
+
+    Notes:
+        Computed directly in the dB domain -- unlike the mean, there's no
+        clean power-domain equivalent of a spread statistic.
     """
     valid_power = power_window[valid_mask]
     if valid_power.size < 2:
@@ -518,21 +604,28 @@ def _extract_window_stats(
 ) -> tuple[float, float, float, float]:
     """
     Mean and standard deviation of HH/HV backscatter in dB over a
-    (2*half+1)x(2*half+1) window centered on grid cell (yi, xi), clipped to
-    whatever part of the window falls inside the frequency A grid extent (a
-    station near an edge may get fewer valid pixels). Within that clipped
-    window, individual pixels with an invalid mask value (0 or 255) or
-    non-positive power are excluded. The mean is computed by averaging in linear
-    power then converting to dB; the std is computed directly on the per-pixel
-    dB values (see _window_std_db). Returns all-NaN if the granule isn't
-    HH/HV-polarized.
+    (2*half+1)x(2*half+1) window centered on grid cell (yi, xi).
 
-    group: the granule's /science/LSAR/GCOV/grids/frequencyA h5py group
-    yi, xi: nearest-pixel grid indices of the station (row, col)
-    ny, nx: frequency A grid dimensions
-    half: window half-size (1 for a 3x3 window)
-    has_hh_hv: whether this granule has HHHH/HVHV datasets
-    returns: (hh_db_mean, hh_db_std, hv_db_mean, hv_db_std)
+    Args:
+        group: The granule's /science/LSAR/GCOV/grids/frequencyA h5py group.
+        yi (int): Station row index.
+        xi (int): Station column index.
+        ny (int): Frequency A grid height.
+        nx (int): Frequency A grid width.
+        half (int): Window half-size (1 for a 3x3 window).
+        has_hh_hv (bool): Whether this granule has HHHH/HVHV datasets.
+
+    Returns:
+        tuple[float, float, float, float]: (hh_db_mean, hh_db_std,
+            hv_db_mean, hv_db_std); all-NaN if not HH/HV-polarized.
+
+    Notes:
+        The window is clipped to whatever part falls inside the grid extent
+        (a station near an edge may get fewer valid pixels); within that,
+        pixels with an invalid mask value (0/255) or non-positive power are
+        excluded. The mean is computed by averaging in linear power then
+        converting to dB; the std directly on the per-pixel dB values (see
+        _window_std_db).
     """
     if not has_hh_hv:
         return np.nan, np.nan, np.nan, np.nan
@@ -562,24 +655,34 @@ def extract_granule_record(
     retryable_statuses: set[int] = RETRYABLE_STATUSES,
 ) -> dict | None:
     """
-    Open one GCOV granule remotely (fsspec + h5py, no download) and extract one
-    row for `station`: HH/HV backscatter mean and standard deviation in dB over a
-    3x3 pixel window centered on the nearest frequency A pixel (excluding
-    individually invalid pixels — see _extract_window_stats), and the true local
-    (terrain-corrected) incidence angle at the center pixel (combining GCOV's
-    per-acquisition LOS vector with the station's DEM-derived surface normal).
+    Open one GCOV granule remotely (fsspec + h5py, no download) and extract
+    one row for `station`.
 
-    result: one earthaccess search_data() result
-    station: station dict with "lon", "lat", "dem_elevation_m" (see compute_station_terrain)
-    station_normal: station["surface_normal_enu"], passed explicitly to avoid
-        recomputing per granule
-    fs: an earthaccess fsspec HTTPS session
-    fsspec_config: kwargs for fs.open (cache_type, block_size, ...)
-    returns: a record dict (matching OUTPUT_COLUMNS minus datetime_utc handling
-        already done), or None if the granule isn't usable for this station
-        (missing frequencyA group, or station outside the grid extent) — distinct
-        from a record with NaN backscatter (e.g. non-HH/HV granule, invalid pixel
-        mask), which is still returned so orbit/angle metadata isn't lost
+    Args:
+        result: One earthaccess search_data() result.
+        station (dict): Station dict with "lon", "lat", "dem_elevation_m"
+            (see compute_station_terrain).
+        station_normal (np.ndarray): station["surface_normal_enu"], passed
+            explicitly to avoid recomputing per granule.
+        fs: An earthaccess fsspec HTTPS session.
+        fsspec_config (dict): kwargs for fs.open (cache_type, block_size, ...).
+        max_retries (int): Retry attempts for a transient fetch error.
+        retry_backoff_seconds (int): Base backoff between retries.
+        retryable_statuses (set[int]): HTTP statuses treated as transient.
+
+    Returns:
+        dict | None: A record dict (matching OUTPUT_COLUMNS), or None if the
+            granule isn't usable for this station (missing frequencyA group,
+            or station outside the grid extent) -- distinct from a record
+            with NaN backscatter (e.g. non-HH/HV granule, invalid pixel
+            mask), which is still returned so orbit/angle metadata isn't lost.
+
+    Notes:
+        HH/HV backscatter mean/std are over a 3x3 window centered on the
+        nearest frequency A pixel (see _extract_window_stats). The true
+        local (terrain-corrected) incidence angle combines GCOV's
+        per-acquisition LOS vector with the station's DEM-derived surface
+        normal.
     """
     native_id = result["meta"]["native-id"]
     url = result.data_links(access="external")[0]
@@ -706,18 +809,19 @@ def process_station(
     all_gpolygons: dict | None = None,
 ) -> None:
     """
-    Full per-station pipeline: search, dedup, track-filter, skip granules already
-    saved, extract each new granule, merge same-pass frames, and append/save to
-    `{station['name']}_NISAR_raw.csv` under output_dir. Prints a status line per
-    station, matching the notebooks' original inline behavior.
+    Full per-station pipeline: search, dedup, track-filter, skip granules
+    already saved, extract each new granule, merge same-pass frames, and
+    append/save to `{station['name']}_NISAR_raw.csv` under output_dir.
 
-    station: station dict with "name", "lon", "lat", "surface_normal_enu",
-        "dem_elevation_m" (see compute_station_terrain)
-    output_dir: directory to write/append the station's CSV in (pathlib.Path)
-    temporal: (start, end) date strings for the CMR search
-    fsspec_config: kwargs for fs.open (cache_type, block_size, ...)
-    all_gpolygons: optional dict to collect native-id -> GPolygon into, for an
-        overview map across all stations; left untouched if None
+    Args:
+        station (dict): Station dict with "name", "lon", "lat",
+            "surface_normal_enu", "dem_elevation_m" (see
+            compute_station_terrain).
+        output_dir (Path): Directory to write/append the station's CSV in.
+        temporal (tuple[str, str]): (start, end) date strings for the CMR search.
+        fsspec_config (dict): kwargs for fs.open (cache_type, block_size, ...).
+        all_gpolygons (dict | None): If given, collects native-id -> GPolygon
+            for an overview map across all stations.
     """
     output_path = output_dir / f"{station['name']}_NISAR_raw.csv"
 

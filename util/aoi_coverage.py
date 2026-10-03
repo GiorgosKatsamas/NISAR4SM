@@ -5,6 +5,21 @@ from shapely import wkt
 
 
 def plot_aoi_coverage(gpolygons, aoi_wkt, product_type):
+    """
+    Interactive map of every granule footprint found for an AOI, overlaid on
+    the AOI boundary itself.
+
+    Args:
+        gpolygons (list): CMR GPolygon dicts (each with a "Boundary" ->
+            "Points" list of {"Latitude", "Longitude"}), one per granule
+            footprint.
+        aoi_wkt (str): AOI boundary as a WKT polygon string.
+        product_type (str): Label for the legend (e.g. "GSLC").
+
+    Returns:
+        ipyleaflet.Map: Satellite basemap with each granule's bounding box
+            (cycled colors) and the AOI boundary (dashed red) drawn on top.
+    """
     colors = cycle([
         "yellow",
         "cyan",

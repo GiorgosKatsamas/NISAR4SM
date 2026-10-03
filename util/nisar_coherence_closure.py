@@ -1,51 +1,31 @@
 """
-Compute pairwise interferometric coherence and closure phase from the per-acquisition
-GSLC window chips saved by moistx/03_get_NISAR_austria_GSLC_windows.ipynb (see
-util/nisar_gslc_windows.py), used by
-moistx/04_calc_coh_phase_closure_NISAR_austria.ipynb.
+Pairwise interferometric coherence and closure phase from NISAR GSLC window chips.
 
-For each station, saved acquisitions are grouped by relative orbit/track (same
-physical ground track = comparable geometry) and sorted by time. A small window
-(3x3 by default, see COHERENCE_WINDOW_HALF / process_station's window_half) centered
-on the station's pixel is used to estimate:
+Reads the per-acquisition window chips saved by 01b_get_nisar_gslc_windows.ipynb
+(util/nisar_gslc_windows.py) and writes two per-station CSVs, used by
+02b_calc_nisar_coherence_closure.ipynb.
 
-- **pairwise coherence (and phase)** for **every** pair in the track (the full
-  `N*(N-1)/2` matrix, not just consecutive-in-time ones) — matching
-  `NISAR_SM.ipynb`'s/`NISAR_SM_alaska.ipynb`'s own full-matrix inversion input,
-  not a reduced subset. `coherence_<pol>` is the magnitude; `phase_<pol>`
-  (radians) is the angle of `sum(s_i * conj(s_j))` — together,
-  `coherence_<pol> * exp(i * phase_<pol>)` reconstructs the same complex
-  interferometric value `calc_SM_coherences`/`invert_sm` need, so a De Zan
-  phase-closure SM inversion can read this CSV directly instead of
-  re-deriving it from the raw GSLC windows a second time.
-- **closure phase** for **every** triplet in the track (the full `C(N,3)`, not
-  just a sequential-sliding subset) — every triplet is kept, none are dropped
-  here. Each triplet row also carries `min_coherence_<pol>`, the minimum of
-  that triplet's three pairwise coherences (legs 12, 23, 13) for that
-  polarization, as a quality metric — low-coherence triplets aren't filtered
-  out at computation time, so they can be screened out downstream (e.g.
-  `min_coherence_HH >= 0.3`) without having to recompute anything.
+For each station/track: coherence + phase for every acquisition pair (the full
+N*(N-1)/2 matrix, matching 03a_estimate_sm_nisar.ipynb's full-matrix inversion
+input) and closure phase for every triplet (C(N,3)), over a window centered on
+the station pixel (COHERENCE_WINDOW_HALF, default 3x3). Both HH and HV are
+computed; pixels flagged invalid by the saved mask (0/255) are excluded.
 
-Each row's `temporal_baseline_days` (pairs) or `temporal_baseline_12_days`/
-`_23_days`/`_13_days` (triplets) records the exact elapsed time between the
-acquisitions in that row, so an irregular gap (e.g. a missing acquisition) is
-visible/filterable downstream rather than silently assumed uniform.
+Columns:
+    coherence_<pol>, phase_<pol>: magnitude and angle of sum(s_i * conj(s_j)).
+    closure_phase_<pol>, min_coherence_<pol>: triplet closure angle and its
+        minimum pairwise leg coherence.
+    temporal_baseline_days / _12_days / _23_days / _13_days: exact elapsed
+        time between the acquisitions in that row.
 
-Same-overpass adjacent-frame acquisitions (a station near a frame boundary can get
-a saved GSLC window from each of two adjacent frames of one physical pass, seconds
-apart — see `_drop_same_pass_duplicates`) are collapsed to one acquisition per
-track *before* pairs/triplets are formed, so "sequential" never means "two
-near-identical looks at the same target seconds apart" next to otherwise ~12-day
-baselines.
-
-Both HH and HV are computed and reported side by side. Pixels flagged invalid by the
-saved `mask` layer (values 0/255 — the same convention already used by the GCOV
-pipeline for GCOV's own mask) are excluded from the window sums.
-
-Small-N caveat: with the default 3x3 window (9 samples), the sample coherence
-estimator is known to be positively biased, most severely at low true coherence
-(Touzi et al. 1999) — increasing COHERENCE_WINDOW_HALF trades spatial resolution
-for a less-biased estimate.
+Notes:
+    Same-overpass adjacent-frame acquisitions (seconds apart) are collapsed to
+    one per track before pairs/triplets are formed -- see
+    _drop_same_pass_duplicates.
+    The default 3x3 window (9 samples) positively biases the coherence
+    estimator, worst at low true coherence (Touzi et al. 1999); increase
+    COHERENCE_WINDOW_HALF to trade spatial resolution for a less-biased
+    estimate.
 """
 
 import re
@@ -85,28 +65,24 @@ def _window_slice(arr: np.ndarray, half_y: int, half_x: int) -> np.ndarray:
 
 def _effective_half(arrays: list[np.ndarray], half: int) -> tuple[int, int]:
     """
-    The largest half-window (half_y, half_x), capped at `half`, that fits inside
+    Largest half-window (half_y, half_x), capped at `half`, that fits inside
     every array in `arrays` without running past an edge.
 
-    Different acquisitions of the *same* station can have different saved window
-    sizes -- GSLC's per-granule pixel spacing is anisotropic and varies granule to
-    granule, so extract_and_save_gslc_window's own window_size_x/y (rounded from a
-    fixed meters-on-the-ground target) legitimately differs between two
-    acquisitions being combined here. _window_slice's fixed `half` used to be
-    applied to every array regardless of its actual size -- fine for an array at
-    least (2*half+1) wide/tall, but numpy silently clips an over-wide slice bound
-    instead of raising, so a narrower array came back a different (smaller) shape
-    than its sibling, and _valid_mask's fixed-size accumulator then failed to
-    broadcast against it. Using the smallest available half across every array
-    being combined keeps every sliced array the same, consistent shape.
+    Args:
+        arrays (list[np.ndarray]): Arrays being combined (2 for a pair, 3 for
+            a triplet).
+        half (int): Requested half-window size.
 
-    Correct as long as the array's own true center is at `_center_index(size)` --
-    true by construction for a window that was never clipped near its granule's
-    grid edge (extract_and_save_gslc_window always centers a not-yet-clipped
-    window via `half_before = window_size // 2`, matching `_center_index`
-    exactly), which is the case this handles. A window that *was* edge-clipped
-    asymmetrically isn't perfectly centered in the saved array either way, and
-    isn't specifically corrected for here.
+    Returns:
+        tuple[int, int]: (half_y, half_x), the largest usable half-window <= `half`.
+
+    Notes:
+        Different acquisitions of the same station can have different saved
+        window sizes (GSLC's per-granule pixel spacing is anisotropic), so
+        the smallest half across every array being combined keeps them all
+        the same shape. Assumes each array's true center is at
+        `_center_index(size)` -- true for a window that wasn't edge-clipped
+        near its granule's grid boundary.
     """
     half_y, half_x = half, half
     for arr in arrays:
@@ -126,18 +102,23 @@ def _complex_pol(ds: xr.Dataset, pol: str) -> np.ndarray | None:
 
 def load_station_acquisitions(gslc_dir: Path, station_name: str) -> dict[int, list[dict]]:
     """
-    Load every saved GSLC window .nc file for `station_name` in gslc_dir, grouped by
-    relative orbit/track number and sorted by acquisition time within each group.
+    Load every saved GSLC window .nc file for `station_name` in `gslc_dir`,
+    grouped by relative orbit/track and sorted by acquisition time within
+    each group.
 
-    gslc_dir: directory containing {station}_{datetime}_track{NNN}_{dir}_{native_id}.nc
-        files (see util/nisar_gslc_windows.py)
-    station_name: station to load files for (matched against the filename prefix)
-    returns: {track_number: [acquisition dict, ...]} sorted by time within each
-        track; each acquisition dict holds "datetime" (pd.Timestamp), "orb_dir",
-        "native_id", "track", "mask" (2D array or None), "path", one entry per
-        POLARIZATIONS (2D complex array, or None if that pol wasn't saved for this
-        acquisition), and "local_incidence_angle_center" (float, the center pixel
-        of that acquisition's local_incidence_angle_deg cube)
+    Args:
+        gslc_dir (Path): Directory of
+            {station}_{datetime}_track{NNN}_{dir}_{native_id}.nc files (see
+            util/nisar_gslc_windows.py).
+        station_name (str): Station to load files for (matched against the
+            filename prefix).
+
+    Returns:
+        dict[int, list[dict]]: {track_number: [acquisition, ...]}, sorted by
+            time within each track. Each acquisition dict holds "datetime"
+            (pd.Timestamp), "orb_dir", "native_id", "track", "mask" (2D array
+            or None), "path", one entry per POLARIZATIONS (2D complex array
+            or None), and "local_incidence_angle_center" (float).
     """
     groups: dict[int, list[dict]] = {}
     for path in sorted(gslc_dir.glob(f"{station_name}_*.nc")):
@@ -173,25 +154,20 @@ def load_station_acquisitions(gslc_dir: Path, station_name: str) -> dict[int, li
 def _drop_same_pass_duplicates(acqs: list[dict]) -> list[dict]:
     """
     Collapse same-overpass adjacent-frame acquisitions (gap <=
-    ADJACENT_PASS_GAP_SECONDS) down to the first one seen, dropping the rest
-    out of the sequence entirely -- a station near a frame boundary can get a
-    saved GSLC window from each of two adjacent frames of the same physical
-    pass, seconds (sometimes 0 seconds) apart, since nisar_gslc_windows.py
-    deliberately keeps them as separate files rather than merging pixel data
-    the way the GCOV pipeline's merge_adjacent_acquisitions merges scalar dB
-    values (averaging two whole windows isn't as simple as averaging two
-    scalars, so this drops the redundant one instead of merging it).
+    ADJACENT_PASS_GAP_SECONDS) down to the first one seen, dropping the rest.
 
-    Left un-deduplicated, a sequential-pair/triplet built from two such
-    near-identical acquisitions has an ~0-day temporal baseline next to
-    otherwise ~12-day baselines -- coherence between two nearly-simultaneous
-    looks at the same target is trivially high, and any correlation against
-    in-situ SM computed from these pairs is structurally biased (SM measured
-    minutes apart is ~identical by construction, regardless of the true
-    decorrelation physics). Found via GraniteCrk tracks 87/92, where
-    consecutive same-pass acquisitions were 0-8 seconds apart.
+    Args:
+        acqs (list[dict]): One track's acquisitions, already sorted by datetime.
 
-    acqs: one track's acquisitions, already sorted by datetime
+    Returns:
+        list[dict]: Acquisitions with same-pass duplicates dropped.
+
+    Notes:
+        A station near a frame boundary can get a GSLC window from each of
+        two adjacent frames of the same physical pass, seconds apart; left
+        in, a pair/triplet built from two such near-identical looks has a
+        trivially high coherence and an in-situ-SM correlation that's
+        structurally biased (found via GraniteCrk tracks 87/92, 0-8s apart).
     """
     if not acqs:
         return acqs
@@ -204,9 +180,19 @@ def _drop_same_pass_duplicates(acqs: list[dict]) -> list[dict]:
 
 
 def _valid_mask(masks: list[np.ndarray | None], half_y: int, half_x: int) -> np.ndarray:
-    """Intersection of validity across however many acquisitions' mask windows are
-    given (2 for a pair, 3 for a triplet); an acquisition with no saved mask
-    contributes no restriction (all pixels treated as valid for it)."""
+    """
+    Intersection of validity across the given acquisitions' mask windows; an
+    acquisition with no saved mask contributes no restriction.
+
+    Args:
+        masks (list[np.ndarray | None]): Per-acquisition mask windows (2 for
+            a pair, 3 for a triplet).
+        half_y (int): Window half-height.
+        half_x (int): Window half-width.
+
+    Returns:
+        np.ndarray: Boolean validity mask, shape (2*half_y+1, 2*half_x+1).
+    """
     valid = np.ones((2 * half_y + 1, 2 * half_x + 1), dtype=bool)
     for mask in masks:
         if mask is not None:
@@ -216,12 +202,21 @@ def _valid_mask(masks: list[np.ndarray | None], half_y: int, half_x: int) -> np.
 
 def pair_coherence(acq1: dict, acq2: dict, pol: str, half: int = COHERENCE_WINDOW_HALF) -> float:
     """
-    Sample coherence |sum(s1 * conj(s2))| / sqrt(sum(|s1|^2) * sum(|s2|^2)) over a
-    window centered on the station pixel (up to (2*half+1)x(2*half+1), smaller if
-    either acquisition's saved window doesn't reach that far -- see
-    _effective_half), excluding pixels flagged invalid in either acquisition's
-    mask. NaN if `pol` wasn't saved for either acquisition, or no valid pixel
-    remains in the window.
+    Sample coherence |sum(s1 * conj(s2))| / sqrt(sum(|s1|^2) * sum(|s2|^2))
+    over a window centered on the station pixel, excluding pixels flagged
+    invalid in either acquisition's mask.
+
+    Args:
+        acq1 (dict): First acquisition (see load_station_acquisitions).
+        acq2 (dict): Second acquisition.
+        pol (str): Polarization, e.g. "HH".
+        half (int): Window half-size (see _effective_half for the actual
+            size used -- smaller than `half` if either saved window doesn't
+            reach that far).
+
+    Returns:
+        float: Coherence magnitude, or NaN if `pol` wasn't saved for either
+            acquisition or no valid pixel remains.
     """
     s1, s2 = acq1.get(pol), acq2.get(pol)
     if s1 is None or s2 is None:
@@ -243,15 +238,23 @@ def pair_coherence_and_phase(
 ) -> tuple[float, complex]:
     """
     Like pair_coherence, but also returns the complex interferometric value
-    `coh * exp(i * angle(sum(s1 * conj(s2))))` -- needed for De Zan-style
-    phase-closure SM inversion (calc_SM_coherences/invert_sm), which needs the
-    actual per-pair phase, not just coherence magnitude or a triplet's already-
-    collapsed closure angle. Shares pair_coherence's exact window/mask handling
-    (_effective_half/_valid_mask/_window_slice) rather than a separate
-    implementation, so the two never silently disagree on which pixels a given
-    pair's coherence was computed over.
+    `coh * exp(i * angle(sum(s1 * conj(s2))))`, for De Zan-style
+    phase-closure SM inversion (calc_SM_coherences/invert_sm), which needs
+    per-pair phase, not just coherence magnitude.
 
-    Returns (nan, nan+0j) under the same conditions as pair_coherence.
+    Args:
+        acq1 (dict): First acquisition.
+        acq2 (dict): Second acquisition.
+        pol (str): Polarization, e.g. "HH".
+        half (int): Window half-size.
+
+    Returns:
+        tuple[float, complex]: (coherence, coh * exp(i * phase)); (nan,
+            nan+0j) under the same conditions as pair_coherence.
+
+    Notes:
+        Shares pair_coherence's window/mask handling exactly, so the two
+        never disagree on which pixels a pair's coherence was computed over.
     """
     s1, s2 = acq1.get(pol), acq2.get(pol)
     if s1 is None or s2 is None:
@@ -275,12 +278,21 @@ def triplet_closure_phase(
     acq1: dict, acq2: dict, acq3: dict, pol: str, half: int = COHERENCE_WINDOW_HALF
 ) -> float:
     """
-    Closure phase angle(z12 * z23 * conj(z13)) in radians, where z_ij = sum(s_i *
-    conj(s_j)) over the window (see pair_coherence for the actual window size
-    used) — equivalent to wrapping phase(z12) + phase(z23) - phase(z13) to
-    (-pi, pi]. Uses pixels valid across all three acquisitions (mask
-    intersection) so the same pixel set contributes to every leg of the loop. NaN
-    under the same conditions as pair_coherence.
+    Closure phase angle(z12 * z23 * conj(z13)) in radians, where
+    z_ij = sum(s_i * conj(s_j)) over the window.
+
+    Args:
+        acq1 (dict): First acquisition.
+        acq2 (dict): Second acquisition.
+        acq3 (dict): Third acquisition.
+        pol (str): Polarization, e.g. "HH".
+        half (int): Window half-size (see pair_coherence).
+
+    Returns:
+        float: Closure phase in (-pi, pi], or NaN under the same conditions
+            as pair_coherence. Uses pixels valid across all three
+            acquisitions (mask intersection), so the same pixel set
+            contributes to every leg of the loop.
     """
     s1, s2, s3 = acq1.get(pol), acq2.get(pol), acq3.get(pol)
     if s1 is None or s2 is None or s3 is None:
@@ -315,9 +327,18 @@ def _finalize(rows: list[dict], columns: list[str], date_columns: list[str], pat
 
 
 def _baseline_days(acq_a: dict, acq_b: dict) -> float:
-    """Elapsed time in days between two acquisitions' datetimes (a signed, exact
-    baseline, not an assumed nominal repeat interval — a missed acquisition
-    between them makes this larger than the nominal cycle)."""
+    """
+    Elapsed time in days between two acquisitions.
+
+    Args:
+        acq_a (dict): Earlier acquisition.
+        acq_b (dict): Later acquisition.
+
+    Returns:
+        float: Signed, exact baseline in days (not an assumed nominal repeat
+            interval -- a missed acquisition between them makes this larger
+            than the nominal cycle).
+    """
     return (acq_b["datetime"] - acq_a["datetime"]).total_seconds() / 86400.0
 
 
@@ -326,33 +347,31 @@ def process_station(
 ) -> tuple[Path, Path]:
     """
     Build and save the full-pairwise-matrix coherence CSV and full-triplet
-    closure phase CSV for one station, from every saved GSLC window .nc file
-    for that station in gslc_dir. Both are fully rebuilt from scratch each run
-    — purely local/in-memory, no network cost to re-run. Every triplet gets a
-    row (none are dropped for low coherence) — each carries a
-    min_coherence_<pol> quality column for downstream filtering.
+    closure-phase CSV for one station.
 
-    Every pair (N*(N-1)/2) and every triplet (C(N,3)) in a track gets a row,
-    not a reduced sequential-only subset (matching NISAR_SM.ipynb's/
-    NISAR_SM_alaska.ipynb's own full-matrix inversion input). coherence_<pol>
-    (magnitude) and phase_<pol> (radians, angle of sum(s_i * conj(s_j))) are
-    both saved per pair so `coherence_<pol> * exp(i * phase_<pol>)`
-    reconstructs the complex interferometric value calc_SM_coherences/
-    invert_sm need, without re-deriving it from the raw GSLC windows a second
-    time downstream.
+    Args:
+        station_name (str): Station to process (matches {station_name}_*.nc
+            in gslc_dir).
+        gslc_dir (Path): Directory of saved GSLC window .nc files (see
+            util/nisar_gslc_windows.py).
+        output_dir (Path): Directory to write the two CSVs into.
+        window_half (int): Half-size of the window centered on the station's
+            pixel (1 = 3x3, 2 = 5x5, ...); see COHERENCE_WINDOW_HALF.
 
-    Each row's temporal_baseline_days (pairs) or temporal_baseline_12_days,
-    _23_days, _13_days (triplets) records the exact elapsed time between the
-    acquisitions in that row, so an irregular gap (e.g. a missing acquisition)
-    is visible/filterable downstream rather than being silently assumed uniform.
+    Returns:
+        tuple[Path, Path]: (coherence_csv_path, closure_phase_csv_path).
 
-    station_name: station to process (matches {station_name}_*.nc in gslc_dir)
-    gslc_dir: directory of saved GSLC window .nc files (see util/nisar_gslc_windows.py)
-    output_dir: directory to write the two CSVs into
-    window_half: half-size of the window centered on the station's pixel used to
-        estimate coherence/closure phase (1 = 3x3, 2 = 5x5, ...); see
-        COHERENCE_WINDOW_HALF
-    returns: (coherence_csv_path, closure_phase_csv_path)
+    Notes:
+        Every pair (N*(N-1)/2) and triplet (C(N,3)) in a track gets a row --
+        not a sequential-only subset -- matching
+        03a_estimate_sm_nisar.ipynb's full-matrix inversion input.
+        `coherence_<pol> * exp(i * phase_<pol>)` reconstructs the complex
+        value calc_SM_coherences/invert_sm need directly from this CSV.
+        `temporal_baseline_days` (pairs) / `_12_days`/`_23_days`/`_13_days`
+        (triplets) records the exact elapsed time between acquisitions, so an
+        irregular gap is visible downstream rather than assumed uniform.
+        Both CSVs are fully rebuilt from scratch each run (local/in-memory,
+        no network cost).
     """
     groups = load_station_acquisitions(gslc_dir, station_name)
 

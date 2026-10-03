@@ -1,6 +1,6 @@
 """
 Per-station NDVI from NASA's HLS (Harmonized Landsat Sentinel-2) collections, used by
-notebooks/05_get_HLS_ndvi.ipynb to sanity-check SM-inversion outliers against
+01c_get_hls_ndvi.ipynb to sanity-check SM-inversion outliers against
 vegetation cover -- not a modeling input, just a quick visual QC signal alongside each
 SAR acquisition date.
 
@@ -78,9 +78,17 @@ DEFAULT_MAX_GAP_DAYS = 5  # widest acceptable gap between a target date and an H
 
 def _short_name(result) -> str | None:
     """
-    HLSL30 or HLSS30, parsed from native-id's "HLS.L30."/"HLS.S30." prefix --
-    result["umm"]["CollectionReference"] has no ShortName field for HLS granules
-    (only EntryTitle), confirmed against a live search (see module note above).
+    HLSL30 or HLSS30, parsed from native-id's "HLS.L30."/"HLS.S30." prefix.
+
+    Args:
+        result: One earthaccess search_data() result.
+
+    Returns:
+        str | None: HLS_L30_SHORT_NAME, HLS_S30_SHORT_NAME, or None.
+
+    Notes:
+        result["umm"]["CollectionReference"] has no ShortName field for HLS
+        granules (only EntryTitle), confirmed against a live search.
     """
     native_id = result["meta"]["native-id"]
     if native_id.startswith("HLS.L30."):
@@ -94,13 +102,14 @@ def _short_name(result) -> str | None:
 
 def inspect_hls_structure(result, fs) -> None:
     """
-    List every asset URL for one HLS granule and open its Red/NIR/Fmask bands to
-    print their shape/dtype/CRS, so the assumptions documented at the top of this
-    module (band-name suffixes, Fmask bit layout) can be checked against a real
-    file before running the full per-station batch below.
+    List every asset URL for one HLS granule and open its Red/NIR/Fmask
+    bands to print their shape/dtype/CRS, to check this module's layout
+    assumptions (band-name suffixes, Fmask bit layout -- see module
+    docstring) against a real file.
 
-    result: one earthaccess search_data() result (HLSL30 or HLSS30)
-    fs: an earthaccess fsspec HTTPS session
+    Args:
+        result: One earthaccess search_data() result (HLSL30 or HLSS30).
+        fs: An earthaccess fsspec HTTPS session.
     """
     short_name = _short_name(result)
     bands = HLS_BANDS.get(short_name)
@@ -143,19 +152,27 @@ def _fetch_band_window(
     retryable_statuses: set[int] = RETRYABLE_STATUSES,
 ) -> np.ndarray:
     """
-    Open one HLS band COG remotely and read a window of pixels covering
-    approximately window_footprint_m x window_footprint_m on the ground, centered
-    on the pixel nearest (lon, lat). No download of the full (~120 MB) file --
-    rasterio/GDAL issues HTTP range requests for just the needed blocks.
+    Open one HLS band COG remotely and read a window of pixels centered on
+    the pixel nearest (lon, lat).
 
-    Retries on transient errors the same way the NISAR pipelines do (the same
-    CloudFront/S3 distribution occasionally answers a range request with a
-    transient 503 under load) -- but with no PER_GRANULE_TIMEOUT_SECONDS wall-clock
-    wrapper, since a COG windowed read is a couple of range requests, not the many
-    small sequential HDF5 metadata reads that made the GSLC pipeline need one.
+    Args:
+        url (str): Band asset URL.
+        lon (float): Station longitude.
+        lat (float): Station latitude.
+        window_footprint_m (float): Target window size in meters on the ground.
+        fs: An earthaccess fsspec HTTPS session.
+        max_retries (int): Retry attempts for a transient fetch error.
+        retry_backoff_seconds (int): Base backoff between retries.
+        retryable_statuses (set[int]): HTTP statuses treated as transient.
 
-    returns: 2D array (native band dtype, typically int16) of the window's raw
-        (unscaled) values
+    Returns:
+        np.ndarray: 2D array (native band dtype, typically int16) of the
+            window's raw (unscaled) values.
+
+    Notes:
+        No download of the full (~120 MB) file -- rasterio/GDAL issues HTTP
+        range requests for just the needed blocks, so (unlike the GSLC
+        pipeline) no wall-clock timeout wrapper is needed here.
     """
     for attempt in range(max_retries):
         try:
@@ -186,10 +203,19 @@ def _fetch_band_window(
 
 def _valid_fmask(fmask_window: np.ndarray) -> np.ndarray:
     """
-    True where a pixel is NOT flagged cloud, cloud-adjacent, cloud-shadow, or
-    snow/ice (see FMASK_BIT_* above) -- water is deliberately not excluded here,
-    since a station's window shouldn't normally contain open water and leaving it
-    in makes an unexpectedly-wet window visible instead of silently dropped.
+    True where a pixel is NOT flagged cloud, cloud-adjacent, cloud-shadow,
+    or snow/ice (see FMASK_BIT_* above).
+
+    Args:
+        fmask_window (np.ndarray): Raw Fmask window.
+
+    Returns:
+        np.ndarray: Boolean validity mask.
+
+    Notes:
+        Water is deliberately not excluded -- a station's window shouldn't
+        normally contain open water, so leaving it in makes an
+        unexpectedly-wet window visible instead of silently dropped.
     """
     cloud = (fmask_window >> FMASK_BIT_CLOUD) & 1
     adjacent = (fmask_window >> FMASK_BIT_ADJACENT_CLOUD_SHADOW) & 1
@@ -206,15 +232,20 @@ def compute_window_ndvi(
     window_footprint_m: float = DEFAULT_WINDOW_FOOTPRINT_M,
 ) -> dict[str, Any]:
     """
-    NDVI over a station window for one HLS granule: mean/std of (NIR-Red)/(NIR+Red)
-    across whichever window pixels aren't flagged cloud/shadow/snow by Fmask.
+    NDVI over a station window for one HLS granule: mean/std of
+    (NIR-Red)/(NIR+Red) across pixels not flagged cloud/shadow/snow by Fmask.
 
-    result: one earthaccess search_data() result (HLSL30 or HLSS30)
-    lon, lat: station coordinates
-    fs: an earthaccess fsspec HTTPS session
-    window_footprint_m: target window size in meters on the ground
-    returns: dict with ndvi_mean, ndvi_std, n_valid_px, n_total_px (NaN/0 if the
-        granule has no usable band for this station, e.g. missing asset)
+    Args:
+        result: One earthaccess search_data() result (HLSL30 or HLSS30).
+        lon (float): Station longitude.
+        lat (float): Station latitude.
+        fs: An earthaccess fsspec HTTPS session.
+        window_footprint_m (float): Target window size in meters on the ground.
+
+    Returns:
+        dict[str, Any]: ndvi_mean, ndvi_std, n_valid_px, n_total_px
+            (NaN/0 if the granule has no usable band for this station, e.g.
+            missing asset).
     """
     short_name = _short_name(result)
     bands = HLS_BANDS.get(short_name)
@@ -271,14 +302,20 @@ def _granule_date(result) -> pd.Timestamp:
 
 def search_hls_for_station(station: dict, temporal: tuple[str, str]) -> list:
     """
-    Search both HLSL30 and HLSS30 for one station's point, combined and sorted by
-    acquisition date. No version dedup / track filtering needed here (unlike the
-    NISAR pipelines) -- HLS has no relative-orbit concept, and CMR doesn't return
-    duplicate CRID versions for it the way it does for NISAR GCOV/GSLC.
+    Search both HLSL30 and HLSS30 for one station's point, combined and
+    sorted by acquisition date.
 
-    station: station dict with "name", "lon", "lat"
-    temporal: (start, end) date strings for the CMR search
-    returns: combined results, sorted by acquisition date
+    Args:
+        station (dict): Station dict with "name", "lon", "lat".
+        temporal (tuple[str, str]): (start, end) date strings for the CMR search.
+
+    Returns:
+        list: Combined results, sorted by acquisition date.
+
+    Notes:
+        No version dedup / track filtering needed here (unlike the NISAR
+        pipelines) -- HLS has no relative-orbit concept, and CMR doesn't
+        return duplicate CRID versions for it.
     """
     import earthaccess
 
@@ -302,27 +339,32 @@ def process_station_ndvi(
     max_gap_days: int = DEFAULT_MAX_GAP_DAYS,
 ) -> Path:
     """
-    For one station, match each of target_dates to the nearest available HLS scene
-    (from search_results, already searched for this station -- see
-    search_hls_for_station) within max_gap_days, compute window NDVI for each
-    match, and save one row per target date to
-    `{station['name']}_HLS_ndvi.csv` under output_dir.
+    For one station, match each of target_dates to the nearest available
+    HLS scene within max_gap_days, compute window NDVI for each match, and
+    save one row per target date to `{station['name']}_HLS_ndvi.csv` under
+    output_dir.
 
-    A target date with no HLS scene within max_gap_days still gets a row (NaN
-    ndvi_mean, gap_days beyond the threshold) rather than being silently dropped,
-    so a station with no coverage is visible instead of just missing from the
-    output entirely.
+    Args:
+        station (dict): Station dict with "name", "lon", "lat".
+        target_dates (list): SAR acquisition dates to match NDVI against
+            (datetime-like).
+        search_results (list): Combined HLSL30+HLSS30 results for this
+            station, sorted by date (see search_hls_for_station).
+        output_dir (Path): Directory to write the CSV into.
+        fs: An earthaccess fsspec HTTPS session.
+        window_footprint_m (float): See compute_window_ndvi.
+        max_gap_days (int): A match beyond this many days from its target
+            date is still recorded (for visibility) but flagged via
+            gap_days rather than trusted.
 
-    station: station dict with "name", "lon", "lat"
-    target_dates: SAR acquisition dates to match NDVI against (datetime-like)
-    search_results: combined HLSL30+HLSS30 results for this station, sorted by
-        date (see search_hls_for_station)
-    output_dir: directory to write the CSV into
-    fs: an earthaccess fsspec HTTPS session
-    window_footprint_m: see compute_window_ndvi
-    max_gap_days: a match beyond this many days from its target date is still
-        recorded (for visibility) but flagged via gap_days rather than trusted
-    returns: path to the saved CSV
+    Returns:
+        Path: Path to the saved CSV.
+
+    Notes:
+        A target date with no HLS scene within max_gap_days still gets a
+        row (NaN ndvi_mean, gap_days beyond the threshold) rather than
+        being silently dropped, so a station with no coverage is visible
+        instead of just missing from the output.
     """
     granule_dates = [_granule_date(r) for r in search_results]
 

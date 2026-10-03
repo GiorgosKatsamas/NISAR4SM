@@ -1,7 +1,7 @@
 """
 Shared pipeline for saving per-acquisition NISAR GSLC image chips (complex SLC
-values + geometry metadata) around each ISMN station, used by the
-moistx/03_get_NISAR_*_GSLC_windows.ipynb notebooks.
+values + geometry metadata) around each ISMN station, used by
+01b_get_nisar_gslc_windows.ipynb.
 
 Unlike util/nisar_station_timeseries.py (one scalar row per acquisition, appended
 to a per-station CSV), this module writes one NetCDF file per acquisition per
@@ -93,13 +93,14 @@ IDENTIFICATION_GROUP = "/science/LSAR/identification"
 
 def inspect_gslc_structure(result, fs, fsspec_config: dict) -> None:
     """
-    Open one GSLC granule remotely and print its frequencyA/radarGrid/identification
-    layout, so the assumptions documented at the top of this module can be checked
-    against a real file before running the full per-station batch below.
+    Open one GSLC granule remotely and print its frequencyA/radarGrid/
+    identification layout, to check this module's layout assumptions
+    (see module docstring) against a real file.
 
-    result: one earthaccess search_data() result
-    fs: an earthaccess fsspec HTTPS session
-    fsspec_config: kwargs for fs.open (cache_type, block_size, ...)
+    Args:
+        result: One earthaccess search_data() result.
+        fs: An earthaccess fsspec HTTPS session.
+        fsspec_config (dict): kwargs for fs.open (cache_type, block_size, ...).
     """
     url = result.data_links(access="external")[0]
     with fs.open(url, **fsspec_config) as fh, h5py.File(fh, "r") as f:
@@ -139,10 +140,20 @@ def inspect_gslc_structure(result, fs, fsspec_config: dict) -> None:
 # --- Per-granule extraction ---------------------------------------------------------
 
 def _read_epsg(group) -> int:
-    """EPSG code from a grids/frequencyA `projection` dataset, tried both as the
-    raw scalar value (GCOV's convention) and via an `epsg_code` attribute (how
-    GSLC_Interferogram.ipynb reads it through xarray) since it's unconfirmed which
-    applies when read via h5py."""
+    """
+    EPSG code from a grids/frequencyA `projection` dataset.
+
+    Args:
+        group: An open h5py frequencyA group.
+
+    Returns:
+        int: EPSG code.
+
+    Notes:
+        Tried both as the raw scalar value (GCOV's convention) and via an
+        `epsg_code` attribute (how GSLC_Interferogram.ipynb reads it through
+        xarray), since it's unconfirmed which applies when read via h5py.
+    """
     proj_ds = group["projection"]
     if "epsg_code" in proj_ds.attrs:
         return int(proj_ds.attrs["epsg_code"])
@@ -152,9 +163,22 @@ def _read_epsg(group) -> int:
 def _read_complex_window(dataset, row0: int, row1: int, col0: int, col1: int) -> np.ndarray:
     """
     Read a window from an SLC polarization dataset as a numpy complex array.
-    Handles both a native complex dtype (h5py's usual mapping for HDF5 files that
-    store complex data as an `r`/`i` compound type) and, defensively, an explicit
-    `r`/`i`-named compound dtype read out as a structured array.
+
+    Args:
+        dataset: An open h5py dataset (a polarization under frequencyA).
+        row0 (int): Window row start.
+        row1 (int): Window row end.
+        col0 (int): Window column start.
+        col1 (int): Window column end.
+
+    Returns:
+        np.ndarray: Complex-valued window.
+
+    Notes:
+        Handles both a native complex dtype (h5py's usual mapping for HDF5
+        files that store complex data as an `r`/`i` compound type) and,
+        defensively, an explicit `r`/`i`-named compound dtype read out as a
+        structured array.
     """
     raw = dataset[row0:row1, col0:col1]
     if np.iscomplexobj(raw):
@@ -177,39 +201,45 @@ def extract_and_save_gslc_window(
     retryable_statuses: set[int] = RETRYABLE_STATUSES,
 ) -> Path | None:
     """
-    Open one GSLC granule remotely (fsspec + h5py, no download), extract a window
-    of pixels centered on the frequency A pixel nearest `station` and covering
-    approximately window_footprint_m x window_footprint_m on the ground, and save
-    it as a NetCDF file under output_dir.
+    Open one GSLC granule remotely (fsspec + h5py, no download), extract a
+    window of pixels centered on the frequency A pixel nearest `station`,
+    and save it as a NetCDF file under `output_dir`.
 
-    The saved file contains, for every polarization present in the granule
-    (HH/HV/VH/VV, whichever apply): `<pol>_real`/`<pol>_imag` (window arrays,
-    since NetCDF has no native complex type). It also contains per-pixel geometry
-    cubes covering the whole window: `incidence_angle_deg` (ellipsoidal),
-    `los_unit_vector_x`/`los_unit_vector_y`, and `local_incidence_angle_deg` (the
-    true DEM-terrain-corrected angle, using the station's single precomputed
-    surface normal — terrain slope/aspect isn't recomputed per pixel, since it
-    varies negligibly across a chip this size). `mask`, if present in the
-    granule, is included unchanged. Metadata (station name/coords, orbit
-    direction/track, acquisition time, native-id) is written as file attrs.
+    Args:
+        result: One earthaccess search_data() result.
+        station (dict): Station dict with "name", "lon", "lat",
+            "dem_elevation_m" (see compute_station_terrain in
+            nisar_station_timeseries.py).
+        station_normal (np.ndarray): station["surface_normal_enu"].
+        fs: An earthaccess fsspec HTTPS session.
+        fsspec_config (dict): kwargs for fs.open (cache_type, block_size, ...).
+        output_dir (Path): Directory to write the NetCDF file into.
+        window_footprint_m (float): Target window size in meters on the
+            ground (not pixels); see Notes.
+        max_retries (int): Retry attempts for a transient fetch error.
+        retry_backoff_seconds (int): Base backoff between retries (doubles
+            each attempt).
+        retryable_statuses (set[int]): HTTP statuses treated as transient.
 
-    result: one earthaccess search_data() result
-    station: station dict with "name", "lon", "lat", "dem_elevation_m" (see
-        compute_station_terrain in nisar_station_timeseries.py)
-    station_normal: station["surface_normal_enu"]
-    fs: an earthaccess fsspec HTTPS session
-    fsspec_config: kwargs for fs.open (cache_type, block_size, ...)
-    output_dir: directory to write the NetCDF file into (pathlib.Path)
-    window_footprint_m: target window size in meters on the ground (not pixels).
-        Converted to separate x/y pixel counts per granule from that granule's own
-        xCoordinateSpacing/yCoordinateSpacing (GSLC's grid is anisotropic), each
-        independently, since a window can't be evenly centered on a single pixel
-        with an even side length either way. The actual achieved footprint (which
-        won't be exactly window_footprint_m, due to rounding to a whole pixel
-        count) is written to the saved file's attrs.
-    returns: path to the saved file, or None if the granule wasn't usable for
-        this station (missing frequencyA group, no recognized polarizations, or
-        station outside the grid extent)
+    Returns:
+        Path | None: Path to the saved file, or None if the granule wasn't
+            usable for this station (missing frequencyA group, no recognized
+            polarizations, or station outside the grid extent).
+
+    Notes:
+        The saved file contains, for every polarization present (HH/HV/VH/VV,
+        whichever apply): `<pol>_real`/`<pol>_imag` (NetCDF has no native
+        complex type). Also per-pixel geometry cubes covering the whole
+        window -- `incidence_angle_deg` (ellipsoidal),
+        `los_unit_vector_x`/`los_unit_vector_y`, and
+        `local_incidence_angle_deg` (DEM-terrain-corrected, using the
+        station's single precomputed surface normal) -- plus `mask` if
+        present, and station/orbit/acquisition metadata as file attrs.
+        `window_footprint_m` is converted to separate x/y pixel counts per
+        granule from that granule's own xCoordinateSpacing/
+        yCoordinateSpacing (GSLC's grid is anisotropic); the actual achieved
+        footprint (not exactly `window_footprint_m`, due to pixel rounding)
+        is written to the saved file's attrs.
     """
     native_id = result["meta"]["native-id"]
     url = result.data_links(access="external")[0]
@@ -391,19 +421,24 @@ def process_station_gslc(
 ) -> None:
     """
     Full per-station GSLC pipeline: search, dedup (CRID), track-filter, skip
-    granules already saved (matched by native-id substring in existing
-    filenames — no network calls beyond the CMR search for already-covered
-    stations), and extract+save each new granule as its own NetCDF window file
-    under output_dir. Prints one status line per station.
+    granules already saved, and extract+save each new granule as its own
+    NetCDF window file under `output_dir`. Prints one status line per station.
 
-    station: station dict with "name", "lon", "lat", "surface_normal_enu",
-        "dem_elevation_m" (see compute_station_terrain)
-    output_dir: directory to write NetCDF files into (pathlib.Path)
-    temporal: (start, end) date strings for the CMR search
-    fsspec_config: kwargs for fs.open (cache_type, block_size, ...)
-    window_footprint_m: see extract_and_save_gslc_window
-    all_gpolygons: optional dict to collect native-id -> GPolygon into, for an
-        overview map across all stations; left untouched if None
+    Args:
+        station (dict): Station dict with "name", "lon", "lat",
+            "surface_normal_enu", "dem_elevation_m" (see
+            compute_station_terrain).
+        output_dir (Path): Directory to write NetCDF files into.
+        temporal (tuple[str, str]): (start, end) date strings for the CMR search.
+        fsspec_config (dict): kwargs for fs.open (cache_type, block_size, ...).
+        window_footprint_m (float): See extract_and_save_gslc_window.
+        all_gpolygons (dict | None): If given, collects native-id -> GPolygon
+            for an overview map across all stations.
+
+    Notes:
+        Already-saved granules are matched by native-id substring in existing
+        filenames -- no network calls beyond the CMR search for already-covered
+        stations.
     """
     results = earthaccess.search_data(
         short_name=GSLC_SHORT_NAME,
